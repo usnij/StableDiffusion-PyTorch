@@ -343,10 +343,17 @@ class UpBlock(nn.Module):
     def forward(self, x, out_down=None, t_emb=None):
         # Upsample
         x = self.up_sample_conv(x)
+        if out_down is not None:
+        # 기존 shape 보정 및 concat
+            if x.shape[2:] != out_down.shape[2:]:
+                min_h = min(x.shape[2], out_down.shape[2])
+                min_w = min(x.shape[3], out_down.shape[3])
+                x = x[:, :, :min_h, :min_w]
+                out_down = out_down[:, :, :min_h, :min_w]
+            x = torch.cat([x, out_down], dim=1)
         
         # Concat with Downblock output
-        if out_down is not None:
-            x = torch.cat([x, out_down], dim=1)
+
         
         out = x
         for i in range(self.num_layers):
@@ -461,8 +468,15 @@ class UpBlockUnet(nn.Module):
     def forward(self, x, out_down=None, t_emb=None, context=None):
         x = self.up_sample_conv(x)
         if out_down is not None:
+        # 기존 shape 보정 및 concat
+            if x.shape[2:] != out_down.shape[2:]:
+                min_h = min(x.shape[2], out_down.shape[2])
+                min_w = min(x.shape[3], out_down.shape[3])
+                x = x[:, :, :min_h, :min_w]
+                out_down = out_down[:, :, :min_h, :min_w]
             x = torch.cat([x, out_down], dim=1)
         
+                
         out = x
         for i in range(self.num_layers):
             # Resnet

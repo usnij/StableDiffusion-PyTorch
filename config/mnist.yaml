@@ -21,6 +21,11 @@ ldm_params:
   num_down_layers: 2
   num_mid_layers: 2
   num_up_layers: 2
+  condition_config:
+    condition_types: ['class']
+    class_condition_config:
+      num_classes: 10
+      cond_drop_prob: 0.0
 
 autoencoder_params:
   z_channels: 3

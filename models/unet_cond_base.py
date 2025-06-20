@@ -181,3 +181,21 @@ class Unet(nn.Module):
         out = self.conv_out(out)
         # out B x C x H x W
         return out
+    
+# models/lora.py
+import torch.nn as nn
+import torch
+
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4, alpha=1.0):
+        super().__init__()
+        self.r = r
+        self.alpha = alpha
+        self.linear = nn.Linear(in_features, out_features, bias=False)
+        self.lora_down = nn.Linear(in_features, r, bias=False)
+        self.lora_up = nn.Linear(r, out_features, bias=False)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x):
+        return self.linear(x) + self.alpha * self.lora_up(self.lora_down(x))
+

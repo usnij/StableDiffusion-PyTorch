@@ -84,7 +84,9 @@ def train(args):
     acc_steps = train_config['autoencoder_acc_steps']
     image_save_steps = train_config['autoencoder_img_save_steps']
     img_save_count = 0
-    
+    print("Current device:", device)
+    print("Model device:", next(model.parameters()).device)
+
     for epoch_idx in range(num_epochs):
         recon_losses = []
         codebook_losses = []

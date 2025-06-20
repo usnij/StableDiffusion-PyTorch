@@ -1,0 +1,13 @@
+my_face0.jpg|a photo of *me* 
+my_face2.jpg|a photo of *me* 
+my_face4.jpg|a photo of *me* 
+my_face6.jpg|a photo of *me* 
+my_face7.jpg|a photo of *me* 
+my_face_glass1.jpg|a photo of *me* wearing glasses
+my_face_glass2.jpg|a photo of *me* wearing glasses
+my_face_smile.jpg|a photo of *me* smiling
+my_face_closeEyes.jpg|a photo of *me* closing my eyes
+my_face_forehead.jpg|a photo of *me* with my bangs up and my forehead coming out
+my_face_glass_closeEye.jpg|a photo of *me* wearing glasses and closing my eyes
+my_face_openEyeswide.jpg|a photo of *me* with my eyes wide open
+my_face_squirtEyes.jpg|a photo of *me* squirt open Eyes
