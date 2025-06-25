@@ -5,11 +5,47 @@ import yaml
 from transformers import CLIPTokenizer, CLIPTextModel
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
 from models.vqvae import VQVAE
+from models.unet_cond_lora import UnetWithLoRA
 import numpy as np
 import torch
 import torch.nn as nn
 import math
 import os
+from models.lora import LoRALinear
+
+def apply_lora_to_linear(module, lora_r, lora_alpha):
+    for name, child in module.named_children():
+        if isinstance(child, LoRALinear):
+            continue
+        if isinstance(child, nn.Linear):
+            # LoRALinear 생성 (bias는 child의 bias 옵션 반영)
+            lora_layer = LoRALinear(child.in_features, child.out_features, lora_r, lora_alpha, bias=(child.bias is not None))
+            # weight/bias 복사
+            lora_layer.weight.data = child.weight.data.clone()
+            if child.bias is not None:
+                lora_layer.bias.data = child.bias.data.clone()
+            setattr(module, name, lora_layer)
+        else:
+            apply_lora_to_linear(child, lora_r, lora_alpha)
+
+
+def freeze_except_lora(module):
+    for name, param in module.named_parameters():
+        # 'lora_'라는 이름이 붙어있으면 True (LoRA만 학습)
+        if 'lora_' in name or 'lora_down' in name or 'lora_up' in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+
+def print_trainable_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"전체 파라미터 수: {total:,}")
+    print(f"학습되는(gradient 켜진) 파라미터 수: {trainable:,}")
+    print(f"Frozen 비율: {100 * (1 - trainable/total):.2f}%")
+    return total, trainable
+
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -37,73 +73,23 @@ embed_data = torch.load("./learned_embeds.bin", map_location="cpu")
 me_id = tokenizer.encode("<me>", add_special_tokens=False)[0]
 with torch.no_grad():
     text_encoder.get_input_embeddings().weight[me_id] = embed_data["<me>"]
-class LoRALinear(nn.Module):
-    def __init__(self, in_features, out_features, r=4, alpha=16):
-        super().__init__()
-        self.r = r
-        self.alpha = alpha
-        self.base = nn.Linear(in_features, out_features)
-        if r > 0:
-            self.lora_A = nn.Linear(in_features, r, bias=False)
-            self.lora_B = nn.Linear(r, out_features, bias=False)
-            self.scaling = alpha / r
-            nn.init.zeros_(self.lora_B.weight)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        else:
-            self.lora_A, self.lora_B, self.scaling = None, None, 1.0
-
-    def forward(self, x):
-        out = self.base(x)
-        if self.r > 0:
-            out = out + self.lora_B(self.lora_A(x)) * self.scaling
-        return out
-
-    @property
-    def weight(self):
-        return self.base.weight
-
-    @property
-    def bias(self):
-        return self.base.bias
 
 
-class UnetLora(Unet):
-    def __init__(self, im_channels, model_config, lora_r=4, lora_alpha=16):
-        super().__init__(im_channels, model_config)
-        self.lora_r = lora_r
-        self.lora_alpha = lora_alpha
-        self.inject_lora()
-
-    def inject_lora(self):
-        # 예시: 주요 Linear 레이어에만 LoRA branch 적용
-        # 실제로는 Attention, Conv2d 등에도 LoRA branch 적용 필요
-        # 아래는 예시로 일부 레이어에만 처리
-        def patch_lora(module):
-            for name, child in module.named_children():
-                # 예시: Linear에만 LoRA 부착
-                if isinstance(child, nn.Linear):
-                    setattr(module, name, LoRALinear(child.in_features, child.out_features, self.lora_r, self.lora_alpha))
-                else:
-                    patch_lora(child)
-        patch_lora(self)
-
-    # forward는 기존 Unet과 동일하게 사용 가능
-
-model = UnetLora(
+model = Unet(
     im_channels=im_channels,
     model_config=ldm_config,
-    lora_r=4,
-    lora_alpha=16
 ).to(device)
 
 # 기존 .pth에는 LoRA 관련 weight가 없음
 pretrained_dict = torch.load("./celebhq/ddpm_ckpt_text_cond_clip.pth", map_location="cpu")
-model_dict = model.state_dict()
+model.load_state_dict(pretrained_dict, strict=False)  # 100% 동일해야 함
 
-# 1. 이름/shape이 겹치는 weight만 불러옴
-compatible_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
-model_dict.update(compatible_dict)
-model.load_state_dict(model_dict)
+# 이후 원하는 부분에 LoRA patch 적용
+apply_lora_to_linear(model, lora_r=4, lora_alpha=16)
+freeze_except_lora(model)
+
+# 사용 예시
+print_trainable_params(model)
 
 for n, p in model.named_parameters():
     if 'lora_' not in n:
@@ -158,7 +144,7 @@ scheduler = LinearNoiseScheduler(
 
 
 # 5. 학습 루프 예시 (텍스트 임베딩 추출)
-num_epochs = 10
+num_epochs = 5
 for epoch in range(num_epochs):
     for imgs, captions in dataloader:
         imgs = imgs.to(device)

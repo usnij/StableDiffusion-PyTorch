@@ -179,6 +179,10 @@ class Unet(nn.Module):
         out = self.norm_out(out)
         out = nn.SiLU()(out)
         out = self.conv_out(out)
+        if out.shape[-2:] != x.shape[-2:]:
+            out = torch.nn.functional.interpolate(out, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        if out.shape[1] != x.shape[1]:  # 예: z_channels=4 등
+            out = nn.Conv2d(out.shape[1], x.shape[1], kernel_size=1).to(out.device)(out)        
         # out B x C x H x W
         return out
     

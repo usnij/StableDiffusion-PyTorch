@@ -17,6 +17,8 @@ from torchvision.utils import make_grid
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+
 def save_reconstruction(vqvae, noisy_z, epoch, save_dir="C:/Users/puzo9/Documents/GitHub/StableDiffusion-PyTorch/finetunig/text_condition_sample"):
     os.makedirs(save_dir, exist_ok=True)
     vqvae.eval()

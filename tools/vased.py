@@ -9,28 +9,11 @@ from models.vqvae import VQVAE
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
 from utils.config_utils import *
 from utils.text_utils import *
-import torch
-import torch.nn as nn
-import math
-from models.unet_cond_lora import UnetWithLoRA
-from models.lora import LoRALinear
+from diffusers import AutoencoderTiny
+
+
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def apply_lora_to_linear(module, lora_r, lora_alpha):
-    for name, child in module.named_children():
-        if isinstance(child, LoRALinear):
-            continue
-        if isinstance(child, nn.Linear):
-            # LoRALinear 생성 (bias는 child의 bias 옵션 반영)
-            lora_layer = LoRALinear(child.in_features, child.out_features, lora_r, lora_alpha, bias=(child.bias is not None))
-            # weight/bias 복사
-            lora_layer.weight.data = child.weight.data.clone()
-            if child.bias is not None:
-                lora_layer.bias.data = child.bias.data.clone()
-            setattr(module, name, lora_layer)
-        else:
-            apply_lora_to_linear(child, lora_r, lora_alpha)
 
 
 def sample(model, scheduler, train_config, diffusion_model_config,
@@ -48,18 +31,15 @@ def sample(model, scheduler, train_config, diffusion_model_config,
                       im_size,
                       im_size)).to(device)
     ###############################################
-    print("[DDPM 샘플러] xt shape:", xt.shape)  # torch.Size([1, 4, 32, 32])가 나와야 함
-
+    
     ############ Create Conditional input ###############
-    text_prompt = ['<me>']
+    text_prompt = ['She is a woman with blond hair. She is wearing lipstick.']
     neg_prompt = ['He is a man.']
     empty_prompt = ['']
     text_prompt_embed = get_text_representation(text_prompt,
                                                 text_tokenizer,
                                                 text_model,
                                                 device)
-    print("me embedding (mean/std):", text_prompt_embed.mean().item(), text_prompt_embed.std().item())
-
     # Can replace empty prompt with negative prompt
     empty_text_embed = get_text_representation(empty_prompt, text_tokenizer, text_model, device)
     assert empty_text_embed.shape == text_prompt_embed.shape
@@ -88,26 +68,20 @@ def sample(model, scheduler, train_config, diffusion_model_config,
         else:
             noise_pred = noise_pred_cond
         
-        #print(f"[Step {i}] noise_pred mean={noise_pred.mean().item()}, std={noise_pred.std().item()}, min={noise_pred.min().item()}, max={noise_pred.max().item()}")
-
         # Use scheduler to get x0 and xt-1
         xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))
         
-        # 샘플링 루프 중간에
-        #print(f"[Step {i}] xt mean={xt.mean().item()}, std={xt.std().item()}, min={xt.min().item()}, max={xt.max().item()}")
-        #print(f"[Step {i}] x0_pred mean={x0_pred.mean().item()}, std={x0_pred.std().item()}")
-
-
         # Save x0
         # ims = torch.clamp(xt, -1., 1.).detach().cpu()
-        if i == 0:
-            # Decode ONLY the final iamge to save time
-            ims = vae.decode(xt)
-        else:
-            ims = x0_pred
+        ims = vae.decode(xt / 0.18215)
+        # Output type에서 tensor만 추출
+        if hasattr(ims, "sample"):
+            ims = ims.sample
+        elif isinstance(ims, dict) and "sample" in ims:
+            ims = ims["sample"]
+        ims = torch.clamp(ims, -1, 1.).detach().cpu()
+
         
-        ims = torch.clamp(ims, -1., 1.).detach().cpu()
-        ims = (ims + 1) / 2
         grid = make_grid(ims, nrow=1)
         img = torchvision.transforms.ToPILImage()(grid)
         
@@ -160,39 +134,31 @@ def infer(args):
         text_tokenizer, text_model = get_tokenizer_and_model(condition_config['text_condition_config']
                                                              ['text_embed_model'], device=device)
     ###############################################
-    ldm_config = config['ldm_params']
-    autoencoder_config = config['autoencoder_params']
-    im_channels = autoencoder_config['z_channels']  
-    ########## Load Unet #############
-    model = Unet(
-        im_channels=im_channels,
-        model_config=ldm_config,
-    ).to(device)
-
-    apply_lora_to_linear(model, lora_r=4, lora_alpha=16)
-
-
-    state_dict = torch.load("unet_with_lora_full.pth", map_location=device)
-    model.load_state_dict(state_dict)
-
-    model.eval()
     
+    ########## Load Unet #############
+    model = Unet(im_channels=autoencoder_model_config['z_channels'],
+                 model_config=diffusion_model_config).to(device)
+    model.eval()
+    if os.path.exists(os.path.join(train_config['task_name'],
+                                   train_config['ldm_ckpt_name'])):
+        print('Loaded unet checkpoint')
+        model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                      train_config['ldm_ckpt_name']),
+                                         map_location=device))
+    else:
+        raise Exception('Model checkpoint {} not found'.format(os.path.join(train_config['task_name'],
+                                                              train_config['ldm_ckpt_name'])))
+    #####################################
     
     # Create output directories
     if not os.path.exists(train_config['task_name']):
         os.mkdir(train_config['task_name'])
     
     ########## Load VQVAE #############
-    vae = VQVAE(im_channels=dataset_config['im_channels'],
-                model_config=autoencoder_model_config).to(device)
-    dummy_img = torch.randn(1, 3, 256, 256).to(device)
-    vae.eval()
-    
-    with torch.no_grad():
-        latent, _ = vae.encode(dummy_img)
-    print("[VQVAE encode] latent shape:", latent.shape)
-    # Load vae if found
-    vae.load_state_dict(torch.load("./celebhq/vqvae_autoencoder_ckpt.pth", map_location=device), strict=True)
+    #vae = VQVAE(im_channels=dataset_config['im_channels'],
+               # model_config=autoencoder_model_config).to(device)
+    #vae.eval()
+    vae = AutoencoderTiny.from_pretrained("madebyollin/taesd").to(device)
 
     with torch.no_grad():
         sample(model, scheduler, train_config, diffusion_model_config,

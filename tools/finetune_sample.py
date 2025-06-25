@@ -1,36 +1,23 @@
+import numpy as np
+import torch
+import random
 import torchvision
 import argparse
 import yaml
 import os
 from torchvision.utils import make_grid
+from PIL import Image
 from tqdm import tqdm
 from models.unet_cond_base import Unet
 from models.vqvae import VQVAE
 from scheduler.linear_noise_scheduler import LinearNoiseScheduler
+from transformers import DistilBertModel, DistilBertTokenizer, CLIPTokenizer, CLIPTextModel
 from utils.config_utils import *
 from utils.text_utils import *
-import torch
-import torch.nn as nn
-import math
-from models.unet_cond_lora import UnetWithLoRA
-from models.lora import LoRALinear
+from dataset.celeb_dataset import CelebDataset
+from models.unet_cond_controlnet import ControlNetUnet
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-def apply_lora_to_linear(module, lora_r, lora_alpha):
-    for name, child in module.named_children():
-        if isinstance(child, LoRALinear):
-            continue
-        if isinstance(child, nn.Linear):
-            # LoRALinear 생성 (bias는 child의 bias 옵션 반영)
-            lora_layer = LoRALinear(child.in_features, child.out_features, lora_r, lora_alpha, bias=(child.bias is not None))
-            # weight/bias 복사
-            lora_layer.weight.data = child.weight.data.clone()
-            if child.bias is not None:
-                lora_layer.bias.data = child.bias.data.clone()
-            setattr(module, name, lora_layer)
-        else:
-            apply_lora_to_linear(child, lora_r, lora_alpha)
 
 
 def sample(model, scheduler, train_config, diffusion_model_config,
@@ -48,27 +35,40 @@ def sample(model, scheduler, train_config, diffusion_model_config,
                       im_size,
                       im_size)).to(device)
     ###############################################
-    print("[DDPM 샘플러] xt shape:", xt.shape)  # torch.Size([1, 4, 32, 32])가 나와야 함
-
+    
     ############ Create Conditional input ###############
-    text_prompt = ['<me>']
-    neg_prompt = ['He is a man.']
+    text_prompt = ['She is a woman with blond hair. She is wearing lipstick.']
+    neg_prompts = ['He is a man.']
     empty_prompt = ['']
     text_prompt_embed = get_text_representation(text_prompt,
                                                 text_tokenizer,
                                                 text_model,
                                                 device)
-    print("me embedding (mean/std):", text_prompt_embed.mean().item(), text_prompt_embed.std().item())
-
     # Can replace empty prompt with negative prompt
     empty_text_embed = get_text_representation(empty_prompt, text_tokenizer, text_model, device)
     assert empty_text_embed.shape == text_prompt_embed.shape
     
+    condition_config = get_config_value(diffusion_model_config, key='condition_config', default_value=None)
+    validate_image_config(condition_config)
+    
+    # This is required to get a random but valid mask
+    dataset = CelebDataset(split='train',
+                           im_path=dataset_config['im_path'],
+                           im_size=dataset_config['im_size'],
+                           im_channels=dataset_config['im_channels'],
+                           use_latents=True,
+                           latent_path=os.path.join(train_config['task_name'],
+                                                    train_config['vqvae_latent_dir_name']),
+                           condition_config=condition_config)
+    mask_idx = random.randint(0, len(dataset.masks))
+    mask = dataset.get_mask(mask_idx).unsqueeze(0).to(device)
     uncond_input = {
-        'text': empty_text_embed
+        'text': empty_text_embed,
+        'image': torch.zeros_like(mask)
     }
     cond_input = {
-        'text': text_prompt_embed
+        'text': text_prompt_embed,
+        'image': mask
     }
     ###############################################
     
@@ -87,36 +87,39 @@ def sample(model, scheduler, train_config, diffusion_model_config,
             noise_pred = noise_pred_uncond + cf_guidance_scale * (noise_pred_cond - noise_pred_uncond)
         else:
             noise_pred = noise_pred_cond
+        #if noise_pred.shape != xt.shape:
+        # spatial 크기 안맞으면 interpolate
+        #    if noise_pred.shape[-2:] != xt.shape[-2:]:
+        #        noise_pred = torch.nn.functional.interpolate(
+        #            noise_pred, size=xt.shape[-2:], mode='bilinear', align_corners=False
+        #        )
+            # 채널 다르면 conv projection (최초 1회만 생성)
+        #    if noise_pred.shape[1] != xt.shape[1]:
+        #        if not hasattr(sample, 'proj_conv'):
+        #            sample.proj_conv = torch.nn.Conv2d(noise_pred.shape[1], xt.shape[1], 1).to(noise_pred.device)
+        #        noise_pred = sample.proj_conv(noise_pred)
+        # ⬆️⬆️⬆️ 이 코드 삽입! ⬆️⬆️⬆️
         
-        #print(f"[Step {i}] noise_pred mean={noise_pred.mean().item()}, std={noise_pred.std().item()}, min={noise_pred.min().item()}, max={noise_pred.max().item()}")
-
         # Use scheduler to get x0 and xt-1
         xt, x0_pred = scheduler.sample_prev_timestep(xt, noise_pred, torch.as_tensor(i).to(device))
         
-        # 샘플링 루프 중간에
-        #print(f"[Step {i}] xt mean={xt.mean().item()}, std={xt.std().item()}, min={xt.min().item()}, max={xt.max().item()}")
-        #print(f"[Step {i}] x0_pred mean={x0_pred.mean().item()}, std={x0_pred.std().item()}")
-
-
         # Save x0
-        # ims = torch.clamp(xt, -1., 1.).detach().cpu()
         if i == 0:
-            # Decode ONLY the final iamge to save time
+            # Decode ONLY the final image to save time
             ims = vae.decode(xt)
         else:
             ims = x0_pred
         
         ims = torch.clamp(ims, -1., 1.).detach().cpu()
         ims = (ims + 1) / 2
-        grid = make_grid(ims, nrow=1)
+        grid = make_grid(ims, nrow=10)
         img = torchvision.transforms.ToPILImage()(grid)
         
-        if not os.path.exists(os.path.join(train_config['task_name'], 'cond_text_samples')):
-            os.mkdir(os.path.join(train_config['task_name'], 'cond_text_samples'))
-        img.save(os.path.join(train_config['task_name'], 'cond_text_samples', 'x0_{}.png'.format(i)))
+        if not os.path.exists(os.path.join(train_config['task_name'], 'cond_text_image_samples')):
+            os.mkdir(os.path.join(train_config['task_name'], 'cond_text_image_samples'))
+        img.save(os.path.join(train_config['task_name'], 'cond_text_image_samples', 'x0_{}.png'.format(i)))
         img.close()
     ##############################################################
-
 
 def infer(args):
     # Read the config file #
@@ -140,17 +143,17 @@ def infer(args):
                                      beta_end=diffusion_config['beta_end'])
     ###############################################
     
-    text_tokenizer = None
-    text_model = None
-    
     ############# Validate the config #################
     condition_config = get_config_value(diffusion_model_config, key='condition_config', default_value=None)
-    assert condition_config is not None, ("This sampling script is for text conditional "
+    assert condition_config is not None, ("This sampling script is for image and text conditional "
                                           "but no conditioning config found")
     condition_types = get_config_value(condition_config, 'condition_types', [])
-    assert 'text' in condition_types, ("This sampling script is for text conditional "
-                                        "but no text condition found in config")
+    assert 'text' in condition_types, ("This sampling script is for image and text conditional "
+                                       "but no text condition found in config")
+    assert 'image' in condition_types, ("This sampling script is for image and text conditional "
+                                       "but no image condition found in config")
     validate_text_config(condition_config)
+    validate_image_config(condition_config)
     ###############################################
     
     ############# Load tokenizer and text model #################
@@ -160,24 +163,17 @@ def infer(args):
         text_tokenizer, text_model = get_tokenizer_and_model(condition_config['text_condition_config']
                                                              ['text_embed_model'], device=device)
     ###############################################
-    ldm_config = config['ldm_params']
-    autoencoder_config = config['autoencoder_params']
-    im_channels = autoencoder_config['z_channels']  
+    
     ########## Load Unet #############
-    model = Unet(
-        im_channels=im_channels,
-        model_config=ldm_config,
-    ).to(device)
-
-    apply_lora_to_linear(model, lora_r=4, lora_alpha=16)
-
-
-    state_dict = torch.load("unet_with_lora_full.pth", map_location=device)
+    model = ControlNetUnet(im_channels=autoencoder_model_config['z_channels'],
+                 model_config=diffusion_model_config).to(device)
+    state_dict = torch.load("finetune_controlnet_ddpm_ckpt_text_image_cond_clip.pth", map_location=device)
     model.load_state_dict(state_dict)
 
+    
+    
+    #####################################
     model.eval()
-    
-    
     # Create output directories
     if not os.path.exists(train_config['task_name']):
         os.mkdir(train_config['task_name'])
@@ -185,24 +181,29 @@ def infer(args):
     ########## Load VQVAE #############
     vae = VQVAE(im_channels=dataset_config['im_channels'],
                 model_config=autoencoder_model_config).to(device)
-    dummy_img = torch.randn(1, 3, 256, 256).to(device)
     vae.eval()
     
-    with torch.no_grad():
-        latent, _ = vae.encode(dummy_img)
-    print("[VQVAE encode] latent shape:", latent.shape)
     # Load vae if found
-    vae.load_state_dict(torch.load("./celebhq/vqvae_autoencoder_ckpt.pth", map_location=device), strict=True)
-
+    if os.path.exists(os.path.join(train_config['task_name'],
+                                   train_config['vqvae_autoencoder_ckpt_name'])):
+        print('Loaded vae checkpoint')
+        vae.load_state_dict(torch.load(os.path.join(train_config['task_name'],
+                                                    train_config['vqvae_autoencoder_ckpt_name']),
+                                       map_location=device))
+    else:
+        raise Exception('VAE checkpoint {} not found'.format(os.path.join(train_config['task_name'],
+                                                                          train_config['vqvae_autoencoder_ckpt_name'])))
+    #####################################
+    
     with torch.no_grad():
         sample(model, scheduler, train_config, diffusion_model_config,
-               autoencoder_model_config, diffusion_config, dataset_config, vae,text_tokenizer, text_model)
+               autoencoder_model_config, diffusion_config, dataset_config, vae, text_tokenizer, text_model)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Arguments for ddpm image generation with only '
-                                                 'text conditioning')
+    parser = argparse.ArgumentParser(description='Arguments for ddpm image generation '
+                                                 'with text and mask conditioning')
     parser.add_argument('--config', dest='config_path',
-                        default='config/celebhq_text_cond.yaml', type=str)
+                        default='config/celebhq_text_image_cond.yaml', type=str)
     args = parser.parse_args()
     infer(args)

@@ -10,6 +10,7 @@ from scheduler.linear_noise_scheduler import LinearNoiseScheduler
 from utils.config_utils import *
 from utils.text_utils import *
 
+
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -30,7 +31,7 @@ def sample(model, scheduler, train_config, diffusion_model_config,
     ###############################################
     
     ############ Create Conditional input ###############
-    text_prompt = ['a photo of <me>']
+    text_prompt = ['She is a woman with blond hair. She is wearing lipstick.']
     neg_prompt = ['He is a man.']
     empty_prompt = ['']
     text_prompt_embed = get_text_representation(text_prompt,

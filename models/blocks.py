@@ -511,5 +511,64 @@ class UpBlockUnet(nn.Module):
                 out = out + out_attn
         
         return out
+    
+
+# --- ControlNet Down Block ---
+class ControlNetDownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_emb_dim, down_sample=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.act1 = nn.SiLU()
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.down = nn.AvgPool2d(2) if down_sample else nn.Identity()
+        # 타임스텝 임베딩을 feature에 주입 (optional)
+        self.t_proj = nn.Linear(t_emb_dim, out_ch)
+
+    def forward(self, x, t_emb):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act1(x)
+        # 타임스텝 정보 주입 (broadcast)
+        t = self.t_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        x = x + t
+        x = self.down(x)
+        return x
+
+# --- ControlNet Mid Block ---
+class ControlNetMidBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_emb_dim):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.act1 = nn.SiLU()
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.t_proj = nn.Linear(t_emb_dim, out_ch)
+    def forward(self, x, t_emb):
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act1(x)
+        t = self.t_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        x = x + t
+        return x
+
+# --- ControlNet Up Block ---
+class ControlNetUpBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, t_emb_dim, up_sample=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.act1 = nn.SiLU()
+        self.norm1 = nn.GroupNorm(8, out_ch)
+        self.up = nn.Upsample(scale_factor=2, mode='nearest') if up_sample else nn.Identity()
+        self.t_proj = nn.Linear(t_emb_dim, out_ch)
+
+    def forward(self, x, skip, t_emb):
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)  # ← in_ch = x 채널 + skip 채널, 즉 self.down_channels[i] * 2
+        x = self.conv1(x)
+        x = self.norm1(x)
+        x = self.act1(x)
+        t = self.t_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+        x = x + t
+        return x
+
 
 
